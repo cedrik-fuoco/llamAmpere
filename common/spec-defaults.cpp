@@ -1,12 +1,14 @@
 #include "spec-defaults.h"
 
 #include "common.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
 #include "speculative.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -73,11 +75,31 @@ const common_speculative_family_default * common_speculative_apply_family_defaul
         return nullptr;
     }
 
+    int32_t n_min_adaptive = user_n_min_adaptive ? spec.draft.n_min_adaptive : row->n_min_adaptive;
+
+    // Small cards are identified by the device's total memory, not by what happens to be free at this
+    // point: the parameters are resolved before the model is loaded, so free VRAM still reads near-full
+    // on an 8 GB card.  Measured cost of the depth-4 drafter at 8K context: about 1.1 GiB (7917 MiB with
+    // it against 6801 MiB without, a 27B at IQ4_XS on an 8 GB card), roughly five layers of that model.
+    // LLAMA_SMALL_VRAM_MIB overrides the threshold in MiB of total device memory (0 disables the cap).
+    static const size_t small_vram_threshold = [] {
+        const char * env = std::getenv("LLAMA_SMALL_VRAM_MIB");
+        return env != nullptr ? (size_t) std::max(0, atoi(env))*1024ull*1024ull : 12ull*1024ull*1024ull*1024ull;
+    }();
+    const size_t device_total = common_device_total_bytes();
+    if (!user_n_max && small_vram_threshold > 0 && device_total > 0 && device_total < small_vram_threshold && n_max > 2) {
+        LOG_INF("speculative: %.0f MiB of device memory, under the small-card threshold: MTP draft depth %d -> 2 "
+                "(depth 4 costs about 1.1 GiB of draft context; --spec-draft-n-max overrides)\n",
+                device_total/(1024.0*1024.0), n_max);
+        n_max          = 2;
+        n_min_adaptive = std::min(n_min_adaptive, 1);
+    }
+
     // same list as --spec-type <type> gives: the handler appends to the default { none }
     spec.types.push_back(row->type);
 
     spec.draft.n_max          = n_max;
-    spec.draft.n_min_adaptive = user_n_min_adaptive ? spec.draft.n_min_adaptive : std::min(row->n_min_adaptive, n_max);
+    spec.draft.n_min_adaptive = std::min(n_min_adaptive, n_max);
 
     if (!(spec.user_set & COMMON_PARAMS_SPECULATIVE_USER_DRAFT_P_MIN)) {
         spec.draft.p_min = row->p_min;

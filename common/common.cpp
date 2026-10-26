@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "gguf.h"
 
@@ -1061,6 +1062,41 @@ bool common_host_memory(uint64_t & total, uint64_t & available) {
     return total > 0;
 }
 
+// free and total memory of the largest GPU device, in bytes (0 when there is none)
+static void common_device_memory_largest(size_t & free_bytes, size_t & total_bytes) {
+    free_bytes  = 0;
+    total_bytes = 0;
+    if (ggml_backend_dev_count() == 0) {
+        // the model's defaults are resolved while the arguments are parsed, which can happen before the CLI
+        // touches a device (see arg.cpp); load the backend registrations so the figures exist here too
+        ggml_backend_load_all();
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.memory_total > total_bytes) {
+            total_bytes = props.memory_total;
+            free_bytes  = props.memory_free;
+        }
+    }
+}
+
+size_t common_device_free_bytes() {
+    size_t free_bytes = 0, total_bytes = 0;
+    common_device_memory_largest(free_bytes, total_bytes);
+    return free_bytes;
+}
+
+size_t common_device_total_bytes() {
+    size_t free_bytes = 0, total_bytes = 0;
+    common_device_memory_largest(free_bytes, total_bytes);
+    return total_bytes;
+}
+
 int32_t common_prompt_cache_ram_auto_mib(uint64_t total, uint64_t available, std::string & why) {
     static const struct { uint32_t gb; int32_t mib; } tiers[] = {
         { 128, 20480 }, { 96, 16384 }, { 64, 12288 }, { 32, 8192 }, { 16, 4096 },
@@ -1540,6 +1576,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
+    }
+
+    // Headroom after the upload.  The fitter's free figure is read before the allocation is touched, so an
+    // over-committed placement passes and only the driver's paging shows it.  Report the real figure as
+    // information: it cannot be a warning, because a working placement reads about the same.  Measured on
+    // an 8 GB card at 8K context: -ngl 30 (works, 8.2 tok/s) and -ngl 36 (pages, 199 tok/s of prompt
+    // processing) both report ~0 MiB free here.  A real spill guard has to probe at request time.
+    {
+        const size_t free_bytes  = common_device_free_bytes();
+        const size_t total_bytes = common_device_total_bytes();
+        const double mib = 1024.0*1024.0;
+        if (total_bytes > 0) {
+            LOG_INF("device memory after load: %.0f MiB free of %.0f MiB (-ngl %d, -c %d)\n",
+                    free_bytes/mib, total_bytes/mib, params.n_gpu_layers, params.n_ctx);
+        }
     }
 
     pimpl->context.reset(lctx);

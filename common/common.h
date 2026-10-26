@@ -1080,6 +1080,11 @@ std::filesystem::path fs_get_cache_file(const std::string & filename);
 // total and available host memory in bytes (MemTotal / MemAvailable on Linux); false if unknown
 bool common_host_memory(uint64_t & total, uint64_t & available);
 
+// free and total memory of the largest GPU device, in bytes; 0 when there is none.  Small cards need
+// this to size the speculative drafter and to notice an over-committed placement after the upload.
+size_t common_device_free_bytes();
+size_t common_device_total_bytes();
+
 // RAM budget of the prompt cache when --cache-ram is not given, from the host's total memory:
 //   < 16 GB -> 2048 MiB, >= 16 -> 4096, >= 32 -> 8192, >= 64 -> 12288, >= 96 -> 16384, >= 128 -> 20480
 // A machine sold as N GB reports a little less than N GiB (firmware and iGPU reservations), so a tier is
